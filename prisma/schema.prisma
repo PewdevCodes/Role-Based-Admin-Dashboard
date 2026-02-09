@@ -1,0 +1,226 @@
+// ============================================================================
+// Prisma Schema — RBAC + Multi-Tenancy Data Model
+// ============================================================================
+// Design decisions:
+// 1. UUID primary keys for security (non-guessable) and distributed safety.
+// 2. Soft deletes via `isActive` — we never hard-delete users/roles/orgs.
+// 3. Global vs org-scoped roles: `organizationId` is nullable on Role.
+//    - NULL  → system-level global role (e.g., SUPER_ADMIN)
+//    - SET   → tenant-scoped role
+// 4. Junction tables (UserRole, RolePermission) allow many-to-many with metadata.
+// 5. AuditLog is append-only — no update/delete operations exposed.
+// 6. RefreshToken table enables token rotation and forced invalidation.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Organization (Tenant) ──────────────────────────────────────────────────
+
+model Organization {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String   @db.VarChar(255)
+  slug        String   @unique @db.VarChar(100)
+  description String?  @db.Text
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  users       User[]
+  roles       Role[]
+  auditLogs   AuditLog[]
+  featureFlags FeatureFlag[]
+
+  @@index([slug])
+  @@index([isActive])
+  @@map("organizations")
+}
+
+// ─── User ───────────────────────────────────────────────────────────────────
+
+model User {
+  id             String   @id @default(uuid()) @db.Uuid
+  email          String   @db.VarChar(255)
+  passwordHash   String   @db.VarChar(255)
+  firstName      String   @db.VarChar(100)
+  lastName       String   @db.VarChar(100)
+  isActive       Boolean  @default(true)
+  emailVerified  Boolean  @default(false)
+  lastLoginAt    DateTime?
+  organizationId String   @db.Uuid
+
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  userRoles      UserRole[]
+  refreshTokens  RefreshToken[]
+  auditLogs      AuditLog[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Unique email per organization — same email can exist across tenants
+  @@unique([email, organizationId])
+  @@index([organizationId])
+  @@index([email])
+  @@index([isActive])
+  @@map("users")
+}
+
+// ─── Role ───────────────────────────────────────────────────────────────────
+// organizationId = NULL → global/system role
+// organizationId = SET  → tenant-scoped role
+
+model Role {
+  id              String   @id @default(uuid()) @db.Uuid
+  name            String   @db.VarChar(100)
+  description     String?  @db.Text
+  isSystem        Boolean  @default(false) // Prevent deletion of system roles
+  isActive        Boolean  @default(true)
+  organizationId  String?  @db.Uuid
+
+  organization    Organization? @relation(fields: [organizationId], references: [id])
+  rolePermissions RolePermission[]
+  userRoles       UserRole[]
+  featureFlags    FeatureFlag[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Role name unique within scope (global or per-org)
+  @@unique([name, organizationId])
+  @@index([organizationId])
+  @@index([isActive])
+  @@map("roles")
+}
+
+// ─── Permission ─────────────────────────────────────────────────────────────
+// Atomic actions — never org-scoped, always global definitions.
+
+model Permission {
+  id          String   @id @default(uuid()) @db.Uuid
+  action      String   @unique @db.VarChar(100) // e.g., USER_CREATE, ROLE_UPDATE
+  description String?  @db.Text
+  resource    String   @db.VarChar(100) // e.g., USER, ROLE, PERMISSION
+  isActive    Boolean  @default(true)
+
+  rolePermissions RolePermission[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([action])
+  @@index([resource])
+  @@map("permissions")
+}
+
+// ─── Junction: User ↔ Role ──────────────────────────────────────────────────
+
+model UserRole {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @db.Uuid
+  roleId    String   @db.Uuid
+  assignedAt DateTime @default(now())
+  assignedBy String?  @db.Uuid // Who assigned this role
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, roleId])
+  @@index([userId])
+  @@index([roleId])
+  @@map("user_roles")
+}
+
+// ─── Junction: Role ↔ Permission ────────────────────────────────────────────
+
+model RolePermission {
+  id           String   @id @default(uuid()) @db.Uuid
+  roleId       String   @db.Uuid
+  permissionId String   @db.Uuid
+  assignedAt   DateTime @default(now())
+  assignedBy   String?  @db.Uuid
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([roleId, permissionId])
+  @@index([roleId])
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+// ─── Refresh Token ──────────────────────────────────────────────────────────
+// Supports rotation: each refresh creates a new token & invalidates the old family.
+
+model RefreshToken {
+  id          String   @id @default(uuid()) @db.Uuid
+  token       String   @unique @db.VarChar(512)
+  userId      String   @db.Uuid
+  family      String   @db.Uuid  // Token family for rotation detection
+  isRevoked   Boolean  @default(false)
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([token])
+  @@index([userId])
+  @@index([family])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+// ─── Audit Log (Immutable) ──────────────────────────────────────────────────
+
+model AuditLog {
+  id             String   @id @default(uuid()) @db.Uuid
+  userId         String?  @db.Uuid
+  action         String   @db.VarChar(100)  // e.g., USER_CREATED, ROLE_UPDATED
+  resource       String   @db.VarChar(100)  // e.g., USER, ROLE
+  resourceId     String?  @db.VarChar(255)
+  organizationId String?  @db.Uuid
+  ipAddress      String?  @db.VarChar(45)
+  userAgent      String?  @db.Text
+  metadata       Json?    // Additional context
+  correlationId  String?  @db.VarChar(100)
+  createdAt      DateTime @default(now())
+
+  user         User?         @relation(fields: [userId], references: [id])
+  organization Organization? @relation(fields: [organizationId], references: [id])
+
+  @@index([userId])
+  @@index([action])
+  @@index([resource])
+  @@index([organizationId])
+  @@index([createdAt])
+  @@index([correlationId])
+  @@map("audit_logs")
+}
+
+// ─── Feature Flag (per Role) ────────────────────────────────────────────────
+
+model FeatureFlag {
+  id             String   @id @default(uuid()) @db.Uuid
+  key            String   @db.VarChar(100) // e.g., ADVANCED_ANALYTICS
+  description    String?  @db.Text
+  isEnabled      Boolean  @default(false)
+  roleId         String?  @db.Uuid
+  organizationId String?  @db.Uuid
+
+  role         Role?         @relation(fields: [roleId], references: [id])
+  organization Organization? @relation(fields: [organizationId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([key, roleId, organizationId])
+  @@index([key])
+  @@index([roleId])
+  @@index([organizationId])
+  @@map("feature_flags")
+}
